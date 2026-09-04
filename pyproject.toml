@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctflib"
+version = "1.0.0"
+description = "HTTP client, flag extractor, callback server and reverse shell listener for CTF web challenges"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+ctflib = "ctflib.__main__:main"
+
+[tool.setuptools]
+packages = ["ctflib"]
