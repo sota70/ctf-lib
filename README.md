@@ -22,7 +22,7 @@ ctf-lib/
 どの作業ディレクトリからでも `import ctflib` できるようにする（editable なのでソースを直せば即反映）:
 
 ```sh
-pip install -e /Users/sota70/workspace/ctf-lib --user --break-system-packages
+pip install -e /path/to/ctf-lib --user --break-system-packages
 ```
 
 この環境の Python は PEP 668 の externally-managed なので `--user --break-system-packages` が要る
@@ -33,7 +33,7 @@ pip install -e /Users/sota70/workspace/ctf-lib --user --break-system-packages
 **そのディレクトリで実行するか** `sys.path` を通す:
 
 ```python
-import sys; sys.path.insert(0, "/Users/sota70/workspace/ctf-lib")
+import sys; sys.path.insert(0, "/path/to/ctf-lib")
 from ctflib import *
 ```
 
