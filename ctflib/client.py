@@ -28,7 +28,6 @@ import threading
 import time
 import urllib.parse
 import zlib
-from concurrent.futures import Future
 from contextlib import AsyncExitStack
 from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
@@ -401,9 +400,6 @@ class Session:
         >>> s = Session(base_url=URL)           # URL: the doctest echo server
         >>> s.get("/echo").text
         'GET /echo'
-        >>> pending = [s.get("/echo", background=True) for _ in range(2)]
-        >>> [future.result(timeout=5).text for future in pending]
-        ['GET /echo', 'GET /echo']
         >>> s.set_cookie("session", "abc")
         >>> s.cookies
         {'session': 'abc'}
@@ -457,44 +453,20 @@ class Session:
     # -- request ----------------------------------------------------------- #
     def request(self, method, url, *, params=None, data=None, json=None, form=None,
                 headers=None, cookies=None, proxy=None, auth=None,
-                timeout=None, allow_redirects=True, verify=None, boundary=None,
-                background=False):
+                timeout=None, allow_redirects=True, verify=None, boundary=None):
         """Send a request and return a :class:`Response`.
 
         ``data`` (url-encoded), ``json`` and ``form`` are mutually
         exclusive and each set their own ``Content-Type``.
         Never raises on 4xx/5xx -- inspect ``response.status``.
 
-        With ``background=True``, return a :class:`concurrent.futures.Future`
-        immediately. Its ``result()`` returns the response or raises the request
-        exception. Requests on this session can run concurrently; cookie access
-        and history updates are protected by a lock. Requests that depend on a
-        previous response's cookies must wait for that response first.
-        Do not mutate session settings, request arguments or open upload files
-        until the request finishes. Network errors are HTTPX exceptions.
-        A result timeout only stops waiting, not the underlying request.
+        Network errors are HTTPX exceptions.
         """
         kwargs = dict(params=params, data=data, json=json, form=form,
                       headers=headers, cookies=cookies, proxy=proxy, auth=auth,
                       timeout=timeout, allow_redirects=allow_redirects,
                       verify=verify, boundary=boundary)
-        if not background:
-            return self._request(method, url, **kwargs)
-
-        future = Future()
-
-        def run():
-            if not future.set_running_or_notify_cancel():
-                return
-            try:
-                response = self._request(method, url, **kwargs)
-            except BaseException as exc:
-                future.set_exception(exc)
-            else:
-                future.set_result(response)
-
-        threading.Thread(target=run, name="ctflib-request", daemon=False).start()
-        return future
+        return self._request(method, url, **kwargs)
 
     def _request(self, method, url, *, params=None, data=None, json=None, form=None,
                  headers=None, cookies=None, proxy=None, auth=None,
@@ -661,8 +633,8 @@ class AsyncSession(Session):
                       timeout=None, allow_redirects=True, verify=None, boundary=None):
         """Send asynchronously and return a :class:`Response`.
 
-        Supports the synchronous session's payload and request options, except
-        ``background``. Use ``await`` or ``asyncio.gather`` instead. HTTP errors
+        Supports the synchronous session's payload and request options.
+        Use ``await`` or ``asyncio.gather`` to receive responses. HTTP errors
         return responses; network failures raise HTTPX exceptions. Cancelling
         the awaiting task cancels the request and closes its response stream.
         """
@@ -738,8 +710,6 @@ class _QueuedSession(Session):
         self._batch_lock = asyncio.Lock()
 
     def request(self, method, url, **kwargs):
-        if kwargs.pop("background", False):
-            return super().request(method, url, background=True, **kwargs)
         pending = _PendingRequest(self, method, url, kwargs)
         self._pending.append(pending)
         return pending
@@ -863,14 +833,10 @@ def request(method, url, **kwargs):
     ``data=`` (url-encoded) / ``json=`` / ``form=`` (multipart, files included)
     set ``Content-Type`` automatically, ``proxy=`` routes the request through
     e.g. Burp.
-    ``background=True`` returns a Future; ``future.result()`` retrieves the
-    response. Requests sharing the default session can run concurrently.
 
     Example:
         >>> request("POST", URL + "/echo", data={"user": "admin"}).text.splitlines()
         ['POST /echo', 'user=admin']
-        >>> request("GET", URL + "/echo", background=True).result(timeout=5).text
-        'GET /echo'
     """
     return default_session.request(method, url, **kwargs)
 

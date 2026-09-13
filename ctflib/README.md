@@ -198,44 +198,13 @@ asyncio.run(main())
 ```
 
 `await client.post(url, json={...})` など、`Session` と同じ送信オプションと `Response` を使える。
-`background` は指定せず、`await` で結果を受け取る。
+`await` で結果を受け取る。
 Cookie の操作（`set_cookie` / `clear_cookies`）は同期 API と同じ。
 ログインの Cookie が必要なリクエストは、ログインを `await` してから送る。
 通信エラーは HTTPX の例外として送出され、タスクのキャンセルは通信にも伝わる。
 
 同じイベントループ内で使い、すべてのリクエストが終了してから `async with` を抜けるか、
 `await client.aclose()` で接続を閉じる。プロキシ・TLS 設定ごとに接続プールを再利用する。
-
-### スレッドによるバックグラウンド実行
-
-`request()` と各 HTTP メソッド（`Session` のメソッドも含む）に `background=True` を渡すと、別スレッドで処理し、
-`concurrent.futures.Future` をすぐ返す。省略時は従来どおり `Response` を返す。
-
-```python
-from ctflib import get, Session
-
-future = get("http://127.0.0.1:8000/status", background=True, timeout=10)
-# 待っている間にメインスレッドで別の作業ができる
-response = future.result(timeout=15)
-print(response.status, response.text)
-
-s = Session(base_url="http://127.0.0.1:8000")
-futures = [s.get(path, background=True) for path in ("/status", "/echo")]
-responses = [future.result(timeout=15) for future in futures]
-```
-
-通信エラーは HTTPX の例外（`httpx.RequestError` など）として発生し、
-バックグラウンド実行では `result()` で再送出される。`result(timeout=...)` は結果を待つ時間で、
-期限を過ぎても通信は停止しない。`cancel()` は処理開始前だけ有効。
-スレッドは非 daemon なので、Python 終了時も実行中の処理の完了を待つ。
-
-同じ `Session` の通信も並列に進む。Cookie の参照・更新と履歴への追加はロックで保護される。
-モジュール直下の関数が共有する `default_session` も同様。
-実行順序は保証されず、`history` はレスポンスの記録順になる。
-ログインなど前のレスポンスの Cookie が必要な通信は、先にその `result()` を待つこと。
-並列レスポンスが同じ Cookie を更新した場合は、後に更新された値が残る。
-完了まではセッション設定・引数の辞書・`jar`・`history` を直接変更せず、
-アップロード用のファイルも閉じたり読み進めたりしないこと。
 
 ---
 

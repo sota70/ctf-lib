@@ -164,53 +164,27 @@ class ServerClientTests(unittest.TestCase):
     def setUp(self):
         self.s = Session(base_url=self.base)
 
-    def test_background_response_updates_session_cookies_and_history(self):
-        response = self.s.get("/setcookie", background=True).result(timeout=5)
+    def test_response_updates_session_cookies_and_history(self):
+        response = self.s.get("/setcookie")
         self.assertEqual(response.status, 200)
         self.assertIs(self.s.history[-1], response)
         self.assertEqual(self.s.cookies["sess"], "abc123")
         self.assertEqual(self.s.get("/whoami").text, "abc123")
 
-    def test_background_post_and_error_status(self):
-        response = self.s.post("/echo", json={"message": "hello"},
-                               background=True).result(timeout=5)
+    def test_post_and_error_status(self):
+        response = self.s.post("/echo", json={"message": "hello"})
         self.assertEqual(json.loads(response.json()["body"]), {"message": "hello"})
-        self.assertEqual(self.s.get("/status", background=True).result(5).status, 418)
+        self.assertEqual(self.s.get("/status").status, 418)
 
-    def test_module_level_background_helper(self):
-        response = ctflib.get(self.base + "/echo", background=True).result(timeout=5)
+    def test_module_level_get_helper(self):
+        response = ctflib.get(self.base + "/echo")
         self.assertEqual(response.json()["method"], "GET")
-
-    def test_background_requests_overlap_and_merge_redirect_cookies(self):
-        barrier = threading.Barrier(2, timeout=5)
-
-        def parallel(req, res):
-            barrier.wait()
-            name = req.params["name"]
-            res.cookie(name, "saved").redirect("/echo")
-
-        self.app.route("/parallel/:name", parallel)
-        for use_helper in (False, True):
-            with self.subTest(module_helper=use_helper):
-                self.s.clear_cookies()
-                self.s.history.clear()
-                with patch.object(ctflib.client, "default_session", self.s):
-                    get = ctflib.get if use_helper else self.s.get
-                    futures = [get("/parallel/" + name, background=True)
-                               for name in ("first", "second")]
-                    responses = [future.result(timeout=10) for future in futures]
-                for name, response in zip(("first", "second"), responses):
-                    self.assertEqual(response.status, 200)
-                    self.assertEqual(response.json()["cookies"][name], "saved")
-                self.assertEqual(self.s.cookies, {"first": "saved", "second": "saved"})
-                self.assertCountEqual(self.s.history, responses)
-                self.assertEqual(self.s.get("/echo").json()["cookies"], self.s.cookies)
 
     def test_response_can_delete_a_session_cookie(self):
         self.app.route("/deletecookie", lambda req, res:
                        res.cookie("sess", "", max_age="0").text("deleted"))
         self.s.get("/setcookie")
-        self.s.get("/deletecookie", background=True).result(timeout=5)
+        self.s.get("/deletecookie")
         self.assertNotIn("sess", self.s.cookies)
         self.assertEqual(self.s.get("/whoami").text, "-")
 
@@ -219,8 +193,7 @@ class ServerClientTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.app.route("/redirect-body", lambda req, res:
                                res.redirect("/echo", code=code))
-                response = self.s.post("/redirect-body", data=b"body",
-                                       background=True).result(timeout=5)
+                response = self.s.post("/redirect-body", data=b"body")
                 self.assertEqual(response.json()["method"], "POST")
                 self.assertEqual(response.json()["body"], "body")
 
@@ -239,7 +212,7 @@ class ServerClientTests(unittest.TestCase):
                 self.assertIn("\n", response.headers["set-cookie"])
                 self.assertEqual(response.cookies, {"one": "1", "two": "2"})
 
-    def test_background_read_timeout_raises_httpx_exception(self):
+    def test_read_timeout_raises_httpx_exception(self):
         release = threading.Event()
 
         def slow(req, res):
@@ -251,9 +224,8 @@ class ServerClientTests(unittest.TestCase):
 
         self.app.route("/slow", slow)
         try:
-            future = self.s.get("/slow", timeout=0.1, background=True)
             with self.assertRaises(httpx.ReadTimeout):
-                future.result(timeout=5)
+                self.s.get("/slow", timeout=0.1)
         finally:
             release.set()
         self.assertEqual(self.s.get("/echo").status, 200)
