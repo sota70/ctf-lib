@@ -1,7 +1,6 @@
 # ctflib
 
 CTF の Web 問題用ライブラリ。HTTP 通信には [HTTPX](https://www.python-httpx.org/) を使用する。
-`pip install -e .` で必要な依存もインストールされる。
 
 ```
 ctf-lib/
@@ -22,22 +21,10 @@ ctf-lib/
 どの作業ディレクトリからでも `import ctflib` できるようにする（editable なのでソースを直せば即反映）:
 
 ```sh
-pip install -e /path/to/ctf-lib --user --break-system-packages
+pip install git+https://github.com/sota70/ctf-lib
 ```
 
-この環境の Python は PEP 668 の externally-managed なので `--user --break-system-packages` が要る
-（`~/.local` にだけ入るのでシステムには触らない）。venv 内なら `pip install -e .` だけでよい。
 戻す時は `pip uninstall ctflib`。
-
-ソースを直接使う場合も `pip install "httpx>=0.28,<0.29"` が必要。
-**そのディレクトリで実行するか** `sys.path` を通す:
-
-```python
-import sys; sys.path.insert(0, "/path/to/ctf-lib")
-from ctflib import *
-```
-
-以降のサンプルは `from ctflib import ...` で書く（`from ctflib import *` でも同じものが入る）。
 
 ---
 
