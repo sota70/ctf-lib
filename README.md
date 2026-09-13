@@ -18,8 +18,6 @@ ctf-lib/
 
 ## インストール
 
-どの作業ディレクトリからでも `import ctflib` できるようにする（editable なのでソースを直せば即反映）:
-
 ```sh
 pip install git+https://github.com/sota70/ctf-lib
 ```
