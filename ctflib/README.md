@@ -1,6 +1,7 @@
 # ctflib
 
-CTF の Web 問題用ライブラリ。外部依存なし（**標準ライブラリのみ**で動く。`requests` 不要）。
+CTF の Web 問題用ライブラリ。HTTP 通信には [HTTPX](https://www.python-httpx.org/) を使用する。
+`pip install -e .` で必要な依存もインストールされる。
 
 ```
 ctf-lib/
@@ -28,7 +29,8 @@ pip install -e /Users/sota70/workspace/ctf-lib --user --break-system-packages
 （`~/.local` にだけ入るのでシステムには触らない）。venv 内なら `pip install -e .` だけでよい。
 戻す時は `pip uninstall ctflib`。
 
-インストールせずに使うなら、**そのディレクトリで実行するか** `sys.path` を通す:
+ソースを直接使う場合も `pip install "httpx>=0.28,<0.29"` が必要。
+**そのディレクトリで実行するか** `sys.path` を通す:
 
 ```python
 import sys; sys.path.insert(0, "/Users/sota70/workspace/ctf-lib")
@@ -138,6 +140,102 @@ s.set_cookie("session", "forged", domain="target")
 ```
 
 モジュール直下の `get()` / `post()` も共有セッション（`default_session`）を使うので Cookie は引き継がれる。
+
+### asyncio による並列送信
+
+`async def` 内では `session()` と `gather()` で並列送信できる。
+`gather` は `from ctflib import *` に含まれる。
+
+```python
+from ctflib import *
+import asyncio
+
+async def main():
+    sess = session()
+    sess.get("https://example.com/")
+    tasks = [sess.get("https://example.com/hoge") for _ in range(20)]
+    resps = await gather(*tasks)
+    print([r.status_code for r in resps])
+
+asyncio.run(main())
+```
+
+イベントループ内で作った `session()` の `get()` / `post()` などは、通信を予約してハンドルを返す。
+実際の送信は `await gather(...)` または `await sess.get(...)` で始まる。
+上の例では、`gather` が最初の `/` への通信を完了させ、Cookie を引き継いで 20 件を並列送信する。
+具体的には、同じセッションで最初の指定ハンドルより前に予約した通信を、予約順に完了させてから並列送信する。
+`gather` の対象より後に予約した通信は、次の `await` / `gather` まで送らない。
+その場で単発の結果が必要なら `response = await sess.get(url)` と書く。
+
+結果の並びは引数順で、同じハンドルを再び渡しても再送信しない。
+バッチ内で接続プールを共有し、終了時には自動で閉じるため `async with` は不要。
+Cookie と履歴は次のバッチにも残る。同じセッションの `gather` 同士は順番に実行する。
+失敗時は未完了の通信をキャンセルして例外を送出する。
+`await gather(*tasks, return_exceptions=True)` なら、通信の例外を結果リストに格納する。
+先行通信に失敗したセッションでは、後続の並列通信を送信しない。
+`await` / `gather` に到達しなければ予約だけでは通信しない。
+
+通常の同期コードで作る `session()` は従来どおりその場で送信し `Response` を返す。
+イベントループ内で同期通信が必要な場合は `Session()` を明示する。
+`ctflib.gather` は予約ハンドル用なので、通常のコルーチンには `asyncio.gather` を使う。
+
+### AsyncSession による明示的な非同期 API
+
+`AsyncSession` は `httpx.AsyncClient` を使い、同じセッション内で接続プールと Cookie を共有する。
+`asyncio.gather` に複数のリクエストを渡すと並列に送信できる。
+
+```python
+import asyncio
+from ctflib import AsyncSession
+
+async def main():
+    async with AsyncSession() as client:
+        tasks = [client.get("http://127.0.0.1:8000/echo") for _ in range(20)]
+        responses = await asyncio.gather(*tasks)
+        print([response.status_code for response in responses])
+
+asyncio.run(main())
+```
+
+`await client.post(url, json={...})` など、`Session` と同じ送信オプションと `Response` を使える。
+`background` は指定せず、`await` で結果を受け取る。
+Cookie の操作（`set_cookie` / `clear_cookies`）は同期 API と同じ。
+ログインの Cookie が必要なリクエストは、ログインを `await` してから送る。
+通信エラーは HTTPX の例外として送出され、タスクのキャンセルは通信にも伝わる。
+
+同じイベントループ内で使い、すべてのリクエストが終了してから `async with` を抜けるか、
+`await client.aclose()` で接続を閉じる。プロキシ・TLS 設定ごとに接続プールを再利用する。
+
+### スレッドによるバックグラウンド実行
+
+`request()` と各 HTTP メソッド（`Session` のメソッドも含む）に `background=True` を渡すと、別スレッドで処理し、
+`concurrent.futures.Future` をすぐ返す。省略時は従来どおり `Response` を返す。
+
+```python
+from ctflib import get, Session
+
+future = get("http://127.0.0.1:8000/status", background=True, timeout=10)
+# 待っている間にメインスレッドで別の作業ができる
+response = future.result(timeout=15)
+print(response.status, response.text)
+
+s = Session(base_url="http://127.0.0.1:8000")
+futures = [s.get(path, background=True) for path in ("/status", "/echo")]
+responses = [future.result(timeout=15) for future in futures]
+```
+
+通信エラーは HTTPX の例外（`httpx.RequestError` など）として発生し、
+バックグラウンド実行では `result()` で再送出される。`result(timeout=...)` は結果を待つ時間で、
+期限を過ぎても通信は停止しない。`cancel()` は処理開始前だけ有効。
+スレッドは非 daemon なので、Python 終了時も実行中の処理の完了を待つ。
+
+同じ `Session` の通信も並列に進む。Cookie の参照・更新と履歴への追加はロックで保護される。
+モジュール直下の関数が共有する `default_session` も同様。
+実行順序は保証されず、`history` はレスポンスの記録順になる。
+ログインなど前のレスポンスの Cookie が必要な通信は、先にその `result()` を待つこと。
+並列レスポンスが同じ Cookie を更新した場合は、後に更新された値が残る。
+完了まではセッション設定・引数の辞書・`jar`・`history` を直接変更せず、
+アップロード用のファイルも閉じたり読み進めたりしないこと。
 
 ---
 
@@ -446,8 +544,7 @@ url_parse("http://x:8080/p?a=1").port    # -> 8080
 
 ## 制限事項
 
-- リクエストヘッダ名は urllib の仕様で `Title-Case` に正規化される（大文字小文字を区別する
-  サーバを狙う場合は生ソケットが必要）。
+- ユーザー指定のリクエストヘッダ名は小文字に正規化される。
 - `verify` は既定で False（自己署名証明書や Burp の MITM 用）。
 - HTTP/2、Brotli、チャンク送信のリクエストには非対応。
 - DOM: フィールドは `<form>` の**中にあるかどうか**でしか紐づかない（`form="id"` 属性は見ない）。

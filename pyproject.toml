@@ -7,7 +7,7 @@ name = "ctflib"
 version = "1.0.0"
 description = "HTTP client, flag extractor, callback server and reverse shell listener for CTF web challenges"
 requires-python = ">=3.8"
-dependencies = []
+dependencies = ["httpx>=0.28,<0.29"]
 
 [project.scripts]
 ctflib = "ctflib.__main__:main"

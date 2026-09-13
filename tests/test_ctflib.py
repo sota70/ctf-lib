@@ -1,6 +1,7 @@
 """End-to-end tests: the client is exercised against the library's own server."""
 
 import io
+import gzip
 import json
 import os
 import shutil
@@ -10,7 +11,11 @@ import sys
 import threading
 import time
 import unittest
+import zlib
 from pathlib import Path
+from unittest.mock import patch
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -158,6 +163,100 @@ class ServerClientTests(unittest.TestCase):
 
     def setUp(self):
         self.s = Session(base_url=self.base)
+
+    def test_background_response_updates_session_cookies_and_history(self):
+        response = self.s.get("/setcookie", background=True).result(timeout=5)
+        self.assertEqual(response.status, 200)
+        self.assertIs(self.s.history[-1], response)
+        self.assertEqual(self.s.cookies["sess"], "abc123")
+        self.assertEqual(self.s.get("/whoami").text, "abc123")
+
+    def test_background_post_and_error_status(self):
+        response = self.s.post("/echo", json={"message": "hello"},
+                               background=True).result(timeout=5)
+        self.assertEqual(json.loads(response.json()["body"]), {"message": "hello"})
+        self.assertEqual(self.s.get("/status", background=True).result(5).status, 418)
+
+    def test_module_level_background_helper(self):
+        response = ctflib.get(self.base + "/echo", background=True).result(timeout=5)
+        self.assertEqual(response.json()["method"], "GET")
+
+    def test_background_requests_overlap_and_merge_redirect_cookies(self):
+        barrier = threading.Barrier(2, timeout=5)
+
+        def parallel(req, res):
+            barrier.wait()
+            name = req.params["name"]
+            res.cookie(name, "saved").redirect("/echo")
+
+        self.app.route("/parallel/:name", parallel)
+        for use_helper in (False, True):
+            with self.subTest(module_helper=use_helper):
+                self.s.clear_cookies()
+                self.s.history.clear()
+                with patch.object(ctflib.client, "default_session", self.s):
+                    get = ctflib.get if use_helper else self.s.get
+                    futures = [get("/parallel/" + name, background=True)
+                               for name in ("first", "second")]
+                    responses = [future.result(timeout=10) for future in futures]
+                for name, response in zip(("first", "second"), responses):
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.json()["cookies"][name], "saved")
+                self.assertEqual(self.s.cookies, {"first": "saved", "second": "saved"})
+                self.assertCountEqual(self.s.history, responses)
+                self.assertEqual(self.s.get("/echo").json()["cookies"], self.s.cookies)
+
+    def test_response_can_delete_a_session_cookie(self):
+        self.app.route("/deletecookie", lambda req, res:
+                       res.cookie("sess", "", max_age="0").text("deleted"))
+        self.s.get("/setcookie")
+        self.s.get("/deletecookie", background=True).result(timeout=5)
+        self.assertNotIn("sess", self.s.cookies)
+        self.assertEqual(self.s.get("/whoami").text, "-")
+
+    def test_redirects_preserve_post_body_for_307_and_308(self):
+        for code in (307, 308):
+            with self.subTest(code=code):
+                self.app.route("/redirect-body", lambda req, res:
+                               res.redirect("/echo", code=code))
+                response = self.s.post("/redirect-body", data=b"body",
+                                       background=True).result(timeout=5)
+                self.assertEqual(response.json()["method"], "POST")
+                self.assertEqual(response.json()["body"], "body")
+
+    def test_compressed_responses_and_duplicate_headers(self):
+        for encoding, body in (("gzip", gzip.compress(b"hello")),
+                               ("deflate", zlib.compress(b"hello")),
+                               ("deflate", zlib.compress(b"hello")[2:-4]),
+                               ("gzip", b"hello")):
+            with self.subTest(encoding=encoding, body=body):
+                def compressed(req, res):
+                    res.headers["Content-Encoding"] = encoding
+                    res.cookie("one", "1").cookie("two", "2").send(body)
+                self.app.route("/compressed", compressed)
+                response = self.s.get("/compressed")
+                self.assertEqual(response.content, b"hello")
+                self.assertIn("\n", response.headers["set-cookie"])
+                self.assertEqual(response.cookies, {"one": "1", "two": "2"})
+
+    def test_background_read_timeout_raises_httpx_exception(self):
+        release = threading.Event()
+
+        def slow(req, res):
+            release.wait(5)
+            try:
+                res.text("done")
+            except BrokenPipeError:
+                pass  # The timed-out client has already closed its socket.
+
+        self.app.route("/slow", slow)
+        try:
+            future = self.s.get("/slow", timeout=0.1, background=True)
+            with self.assertRaises(httpx.ReadTimeout):
+                future.result(timeout=5)
+        finally:
+            release.set()
+        self.assertEqual(self.s.get("/echo").status, 200)
 
     # -- content types --------------------------------------------------- #
     def test_data_dict_is_urlencoded_with_the_matching_content_type(self):
@@ -307,11 +406,31 @@ class ServerClientTests(unittest.TestCase):
         port = _free_port()
         proxy.listen(port, host="127.0.0.1", background=True, quiet=True)
         try:
-            r = self.s.get("/echo", proxy=f"127.0.0.1:{port}")
+            for value in (f"127.0.0.1:{port}",
+                          {"http": f"http://127.0.0.1:{port}"},
+                          {"http": f"127.0.0.1:{port}"}):
+                with self.subTest(proxy=value), patch.dict(
+                    os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}
+                ):
+                    r = self.s.get("/echo", proxy=value)
+                    self.assertEqual(r.text, "via-proxy")
         finally:
             proxy.close()
-        self.assertEqual(r.text, "via-proxy")
-        self.assertEqual(seen, [f"{self.base}/echo"])  # absolute URL == it went through the proxy
+        self.assertEqual(seen, [f"{self.base}/echo"] * 3)
+
+    def test_proxy_environment_and_no_proxy_are_honoured(self):
+        proxy = App(log=False)
+        proxy.default(lambda req, res: res.text("environment-proxy"))
+        port = _free_port()
+        proxy.listen(port, host="127.0.0.1", background=True, quiet=True)
+        try:
+            with patch.dict(os.environ, {"http_proxy": f"http://127.0.0.1:{port}"},
+                            clear=True):
+                self.assertEqual(self.s.get("/echo").text, "environment-proxy")
+                os.environ["no_proxy"] = "127.0.0.1"
+                self.assertEqual(self.s.get("/echo").json()["method"], "GET")
+        finally:
+            proxy.close()
 
     # -- server side ------------------------------------------------------ #
     def test_path_params(self):

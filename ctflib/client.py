@@ -1,4 +1,4 @@
-"""HTTP client for CTF web challenges (standard library only).
+"""HTTP client for CTF web challenges, powered by HTTPX.
 
 The entry point is :func:`request` (plus the ``get`` / ``post`` / ... shortcuts).
 Body payloads are passed through one of three mutually exclusive arguments and
@@ -19,19 +19,21 @@ Passing ``headers={"Content-Type": ...}`` overrides the automatic header, and
 
 from __future__ import annotations
 
+import asyncio
 import gzip
-import io
 import json as _json
 import mimetypes
 import os
-import ssl
+import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import zlib
+from concurrent.futures import Future
+from contextlib import AsyncExitStack
 from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
+
+import httpx
 
 from .dom import parse_html as _parse_html
 from .flag import find_flg as _find_flg
@@ -40,6 +42,7 @@ __all__ = [
     "Headers",
     "Response",
     "Session",
+    "AsyncSession",
     "request",
     "get",
     "post",
@@ -50,14 +53,12 @@ __all__ = [
     "options",
     "encode_multipart",
     "session",
+    "gather",
     "default_session",
 ]
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
 DEFAULT_TIMEOUT = 15
-
-# Methods that keep their body across a redirect (see _RedirectHandler).
-_BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
 class Headers(dict):
@@ -357,99 +358,6 @@ def _build_body(json, form, data, boundary=None):
     return None, None
 
 
-# --------------------------------------------------------------------------- #
-# urllib plumbing
-# --------------------------------------------------------------------------- #
-
-class _RedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Redirect handler that can be disabled and keeps 307/308 bodies."""
-
-    def __init__(self, follow=True):
-        self.follow = follow
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not self.follow:
-            return None
-        new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and code in (307, 308) and req.get_method() in _BODY_METHODS:
-            # urllib downgrades everything to GET; 307/308 must not change method.
-            new = urllib.request.Request(
-                new.full_url, data=req.data, headers=dict(req.headers),
-                origin_req_host=new.origin_req_host, unverifiable=True, method=req.get_method(),
-            )
-        return new
-
-
-class _ErrorPassthrough(urllib.request.HTTPErrorProcessor):
-    """Let 4xx/5xx come back as ordinary responses instead of exceptions.
-
-    3xx still goes through the error machinery so redirects keep working.
-    """
-
-    def http_response(self, request, response):
-        if 300 <= response.status < 400:
-            return super().http_response(request, response)
-        return response
-
-    https_response = http_response
-
-
-class _NoDefaultContentType:
-    """Honours ``headers={"Content-Type": None}``.
-
-    urllib stamps ``x-www-form-urlencoded`` onto any body that has no
-    Content-Type, which would defeat asking for a bare body.
-
-    Note it overrides ``http_request`` rather than ``do_request_``: urllib binds
-    ``http_request = AbstractHTTPHandler.do_request_`` at class definition time,
-    so overriding ``do_request_`` alone would never be called.
-    """
-
-    def _prepare(self, request):
-        request = urllib.request.AbstractHTTPHandler.do_request_(self, request)
-        if getattr(request, "ctflib_no_content_type", False):
-            # remove_header does not normalise case, add_unredirected_header does
-            request.remove_header("Content-type")
-        return request
-
-    http_request = _prepare
-    https_request = _prepare
-
-
-class _HTTPHandler(_NoDefaultContentType, urllib.request.HTTPHandler):
-    pass
-
-
-class _HTTPSHandler(_NoDefaultContentType, urllib.request.HTTPSHandler):
-    pass
-
-
-class _ProxyHandler(urllib.request.ProxyHandler):
-    """Proxy handler that honours an explicit proxy even for no_proxy hosts.
-
-    urllib's default silently drops the proxy when the target matches
-    ``$no_proxy`` -- which hides localhost traffic from Burp, exactly the case
-    that matters here.
-    """
-
-    def proxy_open(self, req, proxy, type):
-        parts = urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy)
-        hostport = parts.netloc
-        if parts.username is not None:
-            import base64
-            user = urllib.parse.unquote(parts.username)
-            password = urllib.parse.unquote(parts.password or "")
-            token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
-            req.add_header("Proxy-authorization", "Basic " + token)
-            hostport = hostport.split("@", 1)[1]
-        orig_type = req.type
-        req.set_proxy(hostport, parts.scheme or orig_type)
-        # http-through-http and anything https is tunnelled by the normal handlers
-        if orig_type in (parts.scheme, "https"):
-            return None
-        return self.parent.open(req, timeout=req.timeout)
-
-
 def _normalise_proxy(proxy):
     """``"127.0.0.1:8080"`` / ``"http://..."`` / ``{"https": ...}`` -> proxy dict."""
     if not proxy:
@@ -493,6 +401,9 @@ class Session:
         >>> s = Session(base_url=URL)           # URL: the doctest echo server
         >>> s.get("/echo").text
         'GET /echo'
+        >>> pending = [s.get("/echo", background=True) for _ in range(2)]
+        >>> [future.result(timeout=5).text for future in pending]
+        ['GET /echo', 'GET /echo']
         >>> s.set_cookie("session", "abc")
         >>> s.cookies
         {'session': 'abc'}
@@ -508,29 +419,33 @@ class Session:
         self.user_agent = user_agent
         self.jar = CookieJar()
         self.history = []
+        self._request_lock = threading.RLock()
 
     # -- cookies ----------------------------------------------------------- #
     @property
     def cookies(self):
-        return {c.name: c.value for c in self.jar}
+        with self._request_lock:
+            return {c.name: c.value for c in self.jar}
 
     def set_cookie(self, name, value, domain="", path="/"):
-        self.jar.set_cookie(Cookie(
-            version=0, name=name, value=value, port=None, port_specified=False,
-            domain=domain, domain_specified=bool(domain), domain_initial_dot=domain.startswith("."),
-            path=path, path_specified=True, secure=False, expires=None, discard=True,
-            comment=None, comment_url=None, rest={}, rfc2109=False,
-        ))
+        with self._request_lock:
+            self.jar.set_cookie(Cookie(
+                version=0, name=name, value=value, port=None, port_specified=False,
+                domain=domain, domain_specified=bool(domain), domain_initial_dot=domain.startswith("."),
+                path=path, path_specified=True, secure=False, expires=None, discard=True,
+                comment=None, comment_url=None, rest={}, rfc2109=False,
+            ))
 
     def clear_cookies(self):
-        self.jar.clear()
+        with self._request_lock:
+            self.jar.clear()
 
     def _cookie_header(self, url, extra):
         """Merge jar cookies for *url* with the per-request ``cookies`` dict."""
-        probe = urllib.request.Request(url)
-        self.jar.add_cookie_header(probe)
+        probe = httpx.Request("GET", url)
+        httpx.Cookies(self.jar).set_cookie_header(probe)
         pairs = []
-        for chunk in (probe.get_header("Cookie") or "").split(";"):
+        for chunk in (probe.headers.get("cookie") or "").split(";"):
             name, sep, value = chunk.strip().partition("=")
             if sep:
                 pairs.append((name, value))
@@ -542,13 +457,82 @@ class Session:
     # -- request ----------------------------------------------------------- #
     def request(self, method, url, *, params=None, data=None, json=None, form=None,
                 headers=None, cookies=None, proxy=None, auth=None,
-                timeout=None, allow_redirects=True, verify=None, boundary=None):
+                timeout=None, allow_redirects=True, verify=None, boundary=None,
+                background=False):
         """Send a request and return a :class:`Response`.
 
         ``data`` (url-encoded), ``json`` and ``form`` are mutually
         exclusive and each set their own ``Content-Type``.
         Never raises on 4xx/5xx -- inspect ``response.status``.
+
+        With ``background=True``, return a :class:`concurrent.futures.Future`
+        immediately. Its ``result()`` returns the response or raises the request
+        exception. Requests on this session can run concurrently; cookie access
+        and history updates are protected by a lock. Requests that depend on a
+        previous response's cookies must wait for that response first.
+        Do not mutate session settings, request arguments or open upload files
+        until the request finishes. Network errors are HTTPX exceptions.
+        A result timeout only stops waiting, not the underlying request.
         """
+        kwargs = dict(params=params, data=data, json=json, form=form,
+                      headers=headers, cookies=cookies, proxy=proxy, auth=auth,
+                      timeout=timeout, allow_redirects=allow_redirects,
+                      verify=verify, boundary=boundary)
+        if not background:
+            return self._request(method, url, **kwargs)
+
+        future = Future()
+
+        def run():
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                response = self._request(method, url, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(response)
+
+        threading.Thread(target=run, name="ctflib-request", daemon=False).start()
+        return future
+
+    def _request(self, method, url, *, params=None, data=None, json=None, form=None,
+                 headers=None, cookies=None, proxy=None, auth=None,
+                 timeout=None, allow_redirects=True, verify=None, boundary=None):
+        method, url, body, final = self._prepare_request(
+            method, url, params=params, data=data, json=json, form=form,
+            headers=headers, cookies=cookies, auth=auth, boundary=boundary,
+        )
+        proxy = self.proxy if proxy is None else proxy
+        verify = self.verify if verify is None else verify
+        proxies = _normalise_proxy(proxy)
+        # Each request owns its transport and redirect cookies. Only received
+        # Set-Cookie headers are merged back, so concurrent updates are not lost.
+        with self._request_lock:
+            request_cookies = httpx.Cookies()
+            for cookie in self.jar:
+                request_cookies.jar.set_cookie(cookie)
+
+        def save_cookies(raw):
+            with self._request_lock:
+                httpx.Cookies(self.jar).extract_cookies(raw)
+
+        with httpx.Client(
+            verify=verify, mounts=_proxy_mounts(proxies, verify, httpx.HTTPTransport),
+            trust_env=not bool(proxies), cookies=request_cookies,
+            follow_redirects=allow_redirects,
+            timeout=self.timeout if timeout is None else timeout,
+            event_hooks={"response": [save_cookies]},
+        ) as client:
+            client.headers.clear()
+            started = time.monotonic()
+            with client.stream(method, url, content=body, headers=final) as raw:
+                content = b"".join(raw.iter_raw())
+            elapsed = time.monotonic() - started
+        return self._record_response(raw, content, method, elapsed)
+
+    def _prepare_request(self, method, url, *, params, data, json, form,
+                         headers, cookies, auth, boundary):
         if self.base_url and "://" not in url:
             url = self.base_url.rstrip("/") + "/" + url.lstrip("/")
         url = _merge_query(url, params)
@@ -565,58 +549,30 @@ class Session:
             import base64
             token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode("utf-8")).decode("ascii")
             final.setdefault("authorization", "Basic " + token)
-        if "cookie" not in final:
-            cookie = self._cookie_header(url, cookies)
-            if cookie:
-                final["cookie"] = cookie
+        with self._request_lock:
+            if "cookie" not in final:
+                cookie = self._cookie_header(url, cookies)
+                if cookie:
+                    final["cookie"] = cookie
+        # Keep header suppression (including Content-Type=None) intact.
+        return method, url, body, {
+            name: value for name, value in final.items() if value is not None
+        }
 
-        proxy = self.proxy if proxy is None else proxy
-        verify = self.verify if verify is None else verify
-        context = ssl.create_default_context()
-        if not verify:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-
-        proxies = _normalise_proxy(proxy)
-        opener = urllib.request.build_opener(
-            _HTTPHandler(),
-            _HTTPSHandler(context=context),
-            urllib.request.HTTPCookieProcessor(self.jar),
-            _RedirectHandler(follow=allow_redirects),
-            _ErrorPassthrough(),
-            # no explicit proxy -> fall back to $http_proxy, like curl does
-            _ProxyHandler(proxies) if proxies else urllib.request.ProxyHandler(),
-        )
-
-        req = urllib.request.Request(url, data=body, method=method)
-        # headers={"Content-Type": None} explicitly asks for a body with no Content-Type
-        req.ctflib_no_content_type = body is not None and final.get("content-type") is None
-        for name, value in final.items():
-            if value is not None:
-                req.add_header(name, value)
-
-        started = time.monotonic()
-        try:
-            raw = opener.open(req, timeout=self.timeout if timeout is None else timeout)
-        except urllib.error.HTTPError as exc:
-            raw = exc  # e.g. a 3xx with allow_redirects=False
-        with raw:
-            content = raw.read()
-        elapsed = time.monotonic() - started
-
-        raw_headers = [(k, v) for k, v in raw.headers.items()]
+    def _record_response(self, raw, content, method, elapsed):
+        raw_headers = raw.headers.multi_items()
         merged = Headers()
         for name, value in raw_headers:
             key = name.lower()
             merged[key] = f"{merged[key]}\n{value}" if key in merged else value
 
         content = _decompress(content, merged.get("content-encoding"))
-        status = getattr(raw, "status", None) or getattr(raw, "code", 0)
         response = Response(
-            url=raw.geturl(), status=status, headers=merged, content=content,
-            method=method, elapsed=elapsed, reason=getattr(raw, "reason", "") or "",
+            url=str(raw.url), status=raw.status_code, headers=merged, content=content,
+            method=method, elapsed=elapsed, reason=raw.reason_phrase,
         )
-        self.history.append(response)
+        with self._request_lock:
+            self.history.append(response)
         return response
 
     def get(self, url, **kw):
@@ -641,15 +597,251 @@ class Session:
         return self.request("OPTIONS", url, **kw)
 
     def __repr__(self):
-        return f"<Session base_url={self.base_url!r} cookies={list(self.cookies)} proxy={self.proxy!r}>"
+        return f"<{type(self).__name__} base_url={self.base_url!r} cookies={list(self.cookies)} proxy={self.proxy!r}>"
+
+
+def _proxy_mounts(proxies, verify, transport):
+    if not proxies:
+        return None
+    return {
+        scheme.rstrip(":/") + "://": transport(
+            proxy=(value if "://" in value else "http://" + value) if value else None,
+            verify=verify,
+        )
+        for scheme, value in proxies.items()
+    }
+
+
+class AsyncSession(Session):
+    """Awaitable HTTP requests with shared cookies and connection pools.
+
+    Use one session within one event loop and close it with ``async with`` or
+    ``await session.aclose()`` after all requests finish. HTTP helpers return
+    coroutines; pass several to ``asyncio.gather`` to send them concurrently.
+    Connections are reused for requests with the same proxy and TLS settings.
+    Cookie helpers remain synchronous. Await login responses before sending
+    requests that need their cookies; concurrent cookie updates are applied in
+    response-header arrival order. Do not mutate settings or upload files while
+    requests are in flight.
+
+    Example:
+        >>> import asyncio
+        >>> async def fetch_many():
+        ...     async with AsyncSession(base_url=URL) as s:
+        ...         responses = await asyncio.gather(
+        ...             *(s.get("/echo") for _ in range(3)))
+        ...         return [r.text for r in responses]
+        >>> asyncio.run(fetch_many())
+        ['GET /echo', 'GET /echo', 'GET /echo']
+    """
+
+    def __init__(self, base_url=None, headers=None, proxy=None, verify=False,
+                 timeout=DEFAULT_TIMEOUT, user_agent=DEFAULT_USER_AGENT):
+        super().__init__(base_url=base_url, headers=headers, proxy=proxy,
+                         verify=verify, timeout=timeout, user_agent=user_agent)
+        self._clients = {}
+        self._closed = False
+
+    async def __aenter__(self):
+        if self._closed:
+            raise RuntimeError("AsyncSession is closed")
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.aclose()
+
+    async def aclose(self):
+        """Close pooled connections after awaiting all outstanding requests."""
+        self._closed = True
+        for client in self._clients.values():
+            await client.aclose()
+
+    async def request(self, method, url, *, params=None, data=None, json=None,
+                      form=None, headers=None, cookies=None, proxy=None, auth=None,
+                      timeout=None, allow_redirects=True, verify=None, boundary=None):
+        """Send asynchronously and return a :class:`Response`.
+
+        Supports the synchronous session's payload and request options, except
+        ``background``. Use ``await`` or ``asyncio.gather`` instead. HTTP errors
+        return responses; network failures raise HTTPX exceptions. Cancelling
+        the awaiting task cancels the request and closes its response stream.
+        """
+        if self._closed:
+            raise RuntimeError("AsyncSession is closed")
+        method, url, body, final = self._prepare_request(
+            method, url, params=params, data=data, json=json, form=form,
+            headers=headers, cookies=cookies, auth=auth, boundary=boundary,
+        )
+        proxies = _normalise_proxy(self.proxy if proxy is None else proxy)
+        verify = self.verify if verify is None else verify
+        key = (verify, tuple(sorted((proxies or {}).items())))
+        client = self._clients.get(key)
+        if client is None:
+            client = httpx.AsyncClient(
+                verify=verify,
+                mounts=_proxy_mounts(proxies, verify, httpx.AsyncHTTPTransport),
+                trust_env=not bool(proxies), cookies=self.jar,
+            )
+            client.headers.clear()
+            self._clients[key] = client
+
+        started = time.monotonic()
+        async with client.stream(
+            method, url, content=body, headers=final,
+            timeout=self.timeout if timeout is None else timeout,
+            follow_redirects=allow_redirects,
+        ) as raw:
+            content = b"".join([chunk async for chunk in raw.aiter_raw()])
+        return self._record_response(raw, content, method, time.monotonic() - started)
 
 
 #: Session used by the module level helpers -- cookies persist between calls.
 default_session = Session()
 
 
+class _PendingRequest:
+    """A request description; constructing it does not open a connection."""
+
+    def __init__(self, owner, method, url, kwargs):
+        self.owner = owner
+        self.method = method
+        self.url = url
+        self.kwargs = kwargs
+        self.done = False
+        self.response = None
+        self.error = None
+
+    async def _send(self, client):
+        if not self.done:
+            try:
+                self.response = await client.request(self.method, self.url, **self.kwargs)
+            except BaseException as exc:
+                self.error = exc
+            self.done = True
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+    def __await__(self):
+        async def receive():
+            return (await gather(self))[0]
+        return receive().__await__()
+
+
+class _QueuedSession(Session):
+    """Session factory's event-loop mode, with automatically closed batches."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._loop = asyncio.get_running_loop()
+        self._pending = []
+        self._batch_lock = asyncio.Lock()
+
+    def request(self, method, url, **kwargs):
+        if kwargs.pop("background", False):
+            return super().request(method, url, background=True, **kwargs)
+        pending = _PendingRequest(self, method, url, kwargs)
+        self._pending.append(pending)
+        return pending
+
+    def _async_session(self):
+        client = AsyncSession(base_url=self.base_url, headers=self.headers,
+                              proxy=self.proxy, verify=self.verify,
+                              timeout=self.timeout, user_agent=self.user_agent)
+        client.jar = self.jar
+        client.history = self.history
+        client._request_lock = self._request_lock
+        return client
+
+
+async def gather(*requests, return_exceptions=False):
+    """Send queued session requests concurrently, returning responses in input order.
+
+    Accepts the awaitable request handles returned by ``session()`` created in
+    an event loop. For each session, requests queued before the earliest selected
+    handle run sequentially first (for login cookies, for example).
+    Requests queued after the selected handles are left for a later batch.
+    A handle is sent at most once, even if gathered or awaited again.
+
+    Connections are shared within each batch and closed before returning.
+    On failure, unfinished batch requests are cancelled before raising. With
+    ``return_exceptions=True``, request errors appear in the result list instead.
+    A failed prerequisite prevents that session's selected requests from being
+    sent. Cancelling gather cancels its in-flight requests. Batches using the
+    same session are serialized. Use one session within one event loop.
+
+    Example:
+        >>> async def main():
+        ...     sess = session(base_url=URL)
+        ...     _ = sess.get("/echo")
+        ...     tasks = [sess.get("/echo") for _ in range(3)]
+        ...     responses = await gather(*tasks)
+        ...     return [r.status_code for r in responses], len(sess.history)
+        >>> asyncio.run(main())
+        ([200, 200, 200], 4)
+    """
+    if any(not isinstance(req, _PendingRequest) for req in requests):
+        raise TypeError("gather expects request handles from session() in an event loop")
+    selected = set(requests)
+    owners = sorted({req.owner for req in requests}, key=id)
+    if any(owner._loop is not asyncio.get_running_loop() for owner in owners):
+        raise RuntimeError("use session() and gather() within the same event loop")
+
+    async with AsyncExitStack() as stack:
+        for owner in owners:
+            await stack.enter_async_context(owner._batch_lock)
+        clients = {
+            owner: await stack.enter_async_context(owner._async_session())
+            for owner in owners
+        }
+        try:
+            for owner in owners:
+                # Earlier unselected requests are prerequisites, not discarded
+                # coroutine objects. Never replay a completed request.
+                batch = [req for req in requests if req.owner is owner and not req.done]
+                if not batch:
+                    continue
+                try:
+                    for req in owner._pending:
+                        if req in selected:
+                            break
+                        if not req.done:
+                            await req._send(clients[owner])
+                except BaseException as exc:
+                    for req in batch:
+                        req.error, req.done = exc, True
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+
+            tasks = {req: asyncio.create_task(req._send(clients[req.owner]))
+                     for req in dict.fromkeys(requests)}
+            try:
+                return await asyncio.gather(
+                    *(tasks[req] for req in requests), return_exceptions=return_exceptions)
+            finally:
+                for task in tasks.values():
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
+                for req, task in tasks.items():
+                    if task.cancelled() and not req.done:
+                        req.error, req.done = asyncio.CancelledError(), True
+        finally:
+            for owner in owners:
+                owner._pending[:] = [req for req in owner._pending if not req.done]
+
+
 def session(**kwargs):
-    """Create a new :class:`Session` (cookies isolated from the default one).
+    """Create a session with cookies isolated from the default session.
+
+    Outside an event loop, requests synchronously return :class:`Response`.
+    Inside an event loop, requests are queued: use ``await gather(*tasks)`` for
+    parallel sending, or ``await sess.get(url)`` for one response. Earlier queued
+    requests are completed before the selected batch. No request is sent until
+    awaited or included as a prerequisite by :func:`gather`. Batch connections
+    close automatically; cookies and history persist for the next batch.
+    Use :class:`Session` explicitly for synchronous calls inside an event loop,
+    or :class:`AsyncSession` for direct ``asyncio.gather`` and long-lived pools.
 
     Example:
         >>> s = session(base_url=URL)
@@ -658,7 +850,11 @@ def session(**kwargs):
         >>> s.cookies                           # its own jar, nothing inherited
         {}
     """
-    return Session(**kwargs)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return Session(**kwargs)
+    return _QueuedSession(**kwargs)
 
 
 def request(method, url, **kwargs):
@@ -667,10 +863,14 @@ def request(method, url, **kwargs):
     ``data=`` (url-encoded) / ``json=`` / ``form=`` (multipart, files included)
     set ``Content-Type`` automatically, ``proxy=`` routes the request through
     e.g. Burp.
+    ``background=True`` returns a Future; ``future.result()`` retrieves the
+    response. Requests sharing the default session can run concurrently.
 
     Example:
         >>> request("POST", URL + "/echo", data={"user": "admin"}).text.splitlines()
         ['POST /echo', 'user=admin']
+        >>> request("GET", URL + "/echo", background=True).result(timeout=5).text
+        'GET /echo'
     """
     return default_session.request(method, url, **kwargs)
 

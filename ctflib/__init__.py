@@ -1,4 +1,4 @@
-"""ctflib -- a small toolbox for CTF web challenges. No external dependencies.
+"""ctflib -- a small toolbox for CTF web challenges, using HTTPX for HTTP.
 
     from ctflib import post, find_flg, route, listen, reverse_shell
 
@@ -32,12 +32,14 @@ from .b64 import (
 from .client import (
     DEFAULT_TIMEOUT,
     DEFAULT_USER_AGENT,
+    AsyncSession,
     Headers,
     Response,
     Session,
     default_session,
     delete,
     encode_multipart,
+    gather,
     get,
     head,
     options,
@@ -104,7 +106,7 @@ __version__ = "1.0.0"
 __all__ = [
     # http client
     "request", "get", "post", "put", "patch", "delete", "head", "options",
-    "Session", "session", "default_session", "Response", "Headers",
+    "Session", "AsyncSession", "session", "gather", "default_session", "Response", "Headers",
     "encode_multipart", "DEFAULT_TIMEOUT", "DEFAULT_USER_AGENT",
     # flags
     "find_flg", "find_flgs", "find_flag", "find_flags",
